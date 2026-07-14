@@ -1,0 +1,948 @@
+configfile: "config/general.yaml"
+import os
+
+# ------------------------------------------------
+# Read sample names
+# ------------------------------------------------
+sample_file = config["sample_file"]
+sample_fh = open(sample_file, "r")
+SAMPLES = sample_fh.read().splitlines()
+sample_fh.close()
+
+tumor_sample_file = config["tumor_sample_file"]
+sample_t = open(tumor_sample_file, "r")
+TUMOR_SAMPLES = sample_t.read().splitlines()
+sample_t.close()
+
+sample_pairs_file = config["sample_pairs_file"]
+sample_pairs_fh = open(sample_pairs_file, "r")
+SAMPLE_PAIRS = {}
+for line in sample_pairs_fh:
+        pair = line.split()
+        SAMPLE_PAIRS[pair[0]] = pair[1]
+
+START_FROM_MAPPED_BAM = config.get("start_from_mapped_bam", False)
+BAM_DIR = str(config["bam_dir"]).rstrip("/\\")
+BAM_DIR_INPUT = str(config["bam_dir_input"]).rstrip("/\\")
+# Picard: always "java -jar <picard_jar> <PicardTool> ..." (see software.picard_jar in config).
+#-----------------------------------------------
+### CreateSequenceDictionary (Picard)
+###Creates a sequence dictionary for a reference sequence. This tool creates a sequence dictionary file (with ".dict" extension) from a reference sequence provided in FASTA format, which is required by many processing and analysis tools. The output file contains a header but no SAMRecords, and the header contains only sequence records.
+### >https://gatk.broadinstitute.org/hc/en-us/articles/360037068312-CreateSequenceDictionary-Picard->
+###The reference sequence can be gzipped (both .fasta and .fasta.gz are supported).
+###
+
+#rule Create_Sequence_Dictionary:
+#        #input:  "/projects/clc/references/genomes/hg19/hg19.fa" #prev line from BCCancer
+#        input:  config["reference"]["hg19"]["ref_fa"]
+#        output: "data/reference_hg19.dict"
+#        params:
+#                java = config["software"]["java"],
+#                picard_jar = config["software"]["picard_jar"]
+#        log: "logs/SeqDict/seqdict.log"
+#        shell:
+#                "{params.java} -jar {params.picard_jar} CreateSequenceDictionary "
+#                "R={input} "
+#                "O={output}"
+#------------------------------------------
+##
+###BedToIntervalList (Picard)
+###<https://gatk.broadinstitute.org/hc/en-us/articles/360036883931-BedToIntervalList-Picard->
+### Converts a BED file to a Picard Interval List. This tool provides easy conversion from BED to the Picard interval_list format which is required by many Picard processing tools. Note that the coordinate system of BED files is such that the first base or position in a sequence is numbered "0", while in interval_list files it is numbered "1".
+###
+#
+
+rule create_interval_list:
+	#possible alternative?
+	#input: "/cluster/projects/aokigroup/Stueckmann/input/hg37/somatic-b37_whole_exome_agilent_1.1_refseq_plus_3_boosters.Homo_sapiens_assembly19.targets.interval_list"
+        #hard-coding input to what I assumed Gerben used for now
+	#copied access-5k-mappable.hg19.bed, renamed to intervals.hg19.bed for combat.
+        input: "data/intervals.hg19.bed"
+        output:"data/interval_list.txt"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                SD = "data/reference_hg19.dict"
+        shell:
+                "{params.java} -jar {params.picard_jar} BedToIntervalList "
+                "I={input} "
+                "O={output} "
+                "SD={params.SD}"
+
+rule create_matching_ref:
+    input:
+        ref=config["reference"]["hg19"]["ref_fa"],
+        order="bam.contig_order.txt"
+    output:
+        fasta="data/hg19.fa",
+        fai="data/hg19.fa.fai",
+        dict="data/reference_hg19.dict"
+    params:
+        java=config["software"]["java"],
+        picard_jar=config["software"]["picard_jar"]
+    shell:
+        """
+        samtools faidx {input.ref} $(cat {input.order}) > {output.fasta}
+        samtools faidx {output.fasta}
+        {params.java} -Xmx4g -jar {params.picard_jar} CreateSequenceDictionary \
+            R={output.fasta} \
+            O={output.dict}
+        """
+
+# IDT workflow: <https://www.idtdna.com/pages/products/next-generation-sequencing/library-preparation/xgen-prism-library-prep-kit?utm_source=google&utm_medium=cpc&utm_campaign=ga_lib_prep&utm_content=ad_group_lib_prep&gclid=CjwKCAjw07qDBhBxEiwA6pPbHv8psmCYHn2fupMN5H3qgKMathc1mhzvVSPe6nxB5gVZFQDempq5txoCSD8QAvD_BwE>
+# <xgen-prism-dna-library-prep-kit-processing-sequencing-data-with-umis.pdf>
+
+
+# ------------------------------------------------
+# Prepare sequencing reads
+# -------------------------------------
+# When start_from_mapped_bam is false (default): FASTQ → unaligned BAM →
+# UMI tags → bam_UMI_align_reads → mapped BAM.
+# When true: omit those rules; place {sample}_mapped.bam under bam_dir on disk
+# for every sample in sample_file before running the workflow.
+# -------------------------------------
+if not START_FROM_MAPPED_BAM:
+    # --------------------------------------------------
+    # 1. Construct an unmapped BAM
+    # Using a demultiplexed FASTQ file, generate an unmapped BAM with FastqToSam (Picard)
+    # -----------------------------------------------------
+    rule bam_UMI_fastq_to_sam:
+            input:
+                    fq1 = "../fastq/{sample}.1.fastq.gz",
+                    fq2 = "../fastq/{sample}.2.fastq.gz"
+            output: BAM_DIR + "/{sample}_unaligned.bam"
+            params:
+                    java = config["software"]["java"],
+                    picard_jar = config["software"]["picard_jar"],
+                    id = "{sample}"
+            log:
+                    "logs/bam_UMI.fastq_to_sam/{sample}.log"
+            shell:
+                    "{params.java} -jar {params.picard_jar} FastqToSam "
+                    "O={output} "
+                    "F1={input.fq1} F2={input.fq2} "
+                    "SM={params.id} LB={params.id} PU=unit1 PL=illumina"
+
+    rule get_unaligned_bam:
+            input: expand(BAM_DIR + "/{sample}_unaligned.bam", sample = SAMPLES)
+
+    # -----------------------------------------------------------
+    # 2. Extract UMIs and add to the RX tag
+    # ExtractUmisFromBam (fgbio) processes unmapped BAM files, extracting in-line UMIs contained within read 1 or read 2 sequences and adds them to into the RX tag
+    # -------------------------------------------------------------
+    rule bam_UMI_extract_UMIs:
+            input: BAM_DIR + "/{sample}_unaligned.bam"
+            output: BAM_DIR + "/{sample}_unaligned_umi.bam"
+            params:
+                    java = config["software"]["java"],
+                    fgbio_jar = config["software"]["fgbio_jar"]
+            log: "logs/bam_UMI.extract_UMIs/{sample}.log"
+            shell:
+                    "{params.java} -jar {params.fgbio_jar} ExtractUmisFromBam "
+                    "--input={input} "
+                    "--output={output} "
+                    "--read-structure 3M2S146T 3M2S146T --molecular-index-tags ZA ZB --single-tag=RX"
+
+    rule get_unaligned_umi_bam:
+            input: expand(BAM_DIR + "/{sample}_unaligned_umi.bam", sample = SAMPLES)
+
+    #---------------------------------------------------------------------
+    # 3. Align reads
+    # When you have an unmapped BAM file with RX tags, use a combination of an aligner and MergeBamAlignment (Picard) to generate a mapped BAM that includes all necessary metadata including the UMIs.
+    # note: MergeBamAlignemnet requires the unmapped BAM file to be in "queryname" sort order. In this cases, the BAM file output by ExtractUmisFromBam is already in the correct sort order
+    # -------------------------------------------------------------------
+    rule bam_UMI_align_reads:
+            input: BAM_DIR + "/{sample}_unaligned_umi.bam"
+            output: BAM_DIR + "/{sample}_mapped.bam"
+            params:
+                    java = config["software"]["java"],
+                    picard_jar = config["software"]["picard_jar"],
+                    bwa = config["software"]["bwa"],
+                    ref = config["reference"]["hg19"]["ref_fa"]
+            log: "logs/bam_UMI.align_reads/{sample}.log"
+            shell:
+                    "{params.java} -jar {params.picard_jar} SamToFastq "
+                    "I={input} F=/dev/stdout INTERLEAVE=true "
+                    "| {params.bwa} mem -p -t 8 {params.ref} /dev/stdin "
+                    "| {params.java} -jar {params.picard_jar} MergeBamAlignment "
+                    "UNMAPPED={input} ALIGNED=/dev/stdin "
+                    "O={output} R={params.ref} "
+                    "SO=coordinate ALIGNER_PROPER_PAIR_FLAGS=true MAX_GAPS=-1 "
+                    "ORIENTATIONS=FR VALIDATION_STRINGENCY=SILENT CREATE_INDEX=true"
+
+rule get_bam_UMI_aligned: 
+        input: expand(BAM_DIR + "/{sample}_mapped.bam", sample = SAMPLES)
+#------------------------------------------------------------------------
+# **Deduplication or error correction ** 
+# A. Deduplicate by start-stop position
+# B. Deduplicate by UMI
+# C. Error correction by collapsing single read families
+# D. Error correction by collapsing combined read families
+#--------------------------------------------------------------------------
+
+
+#----------------------------------------------------------------------
+# A.Deduplicate by start-stop position 
+#----------------------------------------------------------------------
+rule markdup_bam:
+        input: BAM_DIR_INPUT + "/{sample}_mapped.bam"
+        output:
+                bam = BAM_DIR + "/{sample}_mapped.markdup.bam",
+                metrics = "metrics/{sample}.dup_metrics"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"]
+        log: "logs/markdup_bam/{sample}.log"
+        shell:
+                                "{params.java} -Xmx4g -jar {params.picard_jar} MarkDuplicates I={input} O={output.bam}  M={output.metrics} &> {log}"
+
+rule dedupl_start_stop:
+	input:expand(BAM_DIR + "/{sample}_mapped.markdup.bam",sample = SAMPLES)
+
+
+#----------------------------------------------------------------------
+# B. Deduplicate by UMI
+#---------------------------------------------------------------------
+rule markdup_UMI_bam:
+        input: BAM_DIR_INPUT + "/{sample}_mapped.bam"
+        output:
+                bam = BAM_DIR + "/{sample}_mapped.markdup_UMI.bam",
+                metrics = "metrics/{sample}.dup_UMI.metrics"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"]
+        log: "logs/markdup_UMI_bam/{sample}.log"
+        shell:
+                "{params.java} -Xmx4g -jar {params.picard_jar} MarkDuplicates I={input} O={output.bam} BARCODE_TAG=RX  M={output.metrics} &> {log}"
+
+rule dedupl_UMI:
+	input:expand(BAM_DIR + "/{sample}_mapped.markdup_UMI.bam",sample = SAMPLES)
+# -----------------------------------------
+# Steps that are shared between C and D (single read families and combined read families)
+# ----------------------------------
+
+# -------------------------------------------------------------------------
+# C/D.1 Correct errors in UMI sequences
+#-----------------------------------------------------------------------
+#rule fix_UMIs:
+#	input: BAM_DIR + "/{sample}_mapped.bam"
+#	output: bam = BAM_DIR + "/{sample}_fixedUMIs.bam",
+#		rejects = BAM_DIR + "/{sample}_fixedUMIs.rejected.bam",
+#		metrics = "metrics/{sample}_fixedUMIs.metrics"
+#	params:
+#                java = config["software"]["java"],
+#                fgbio_jar = config["software"]["fgbio_jar"],
+#		umis_list = config["umis_file"] 
+#	log: "logs/fixedUMIs/{sample}.log"
+#	shell:
+#                "{params.java} -Xmx16G -jar {params.fgbio_jar} CorrectUmis "
+#                "--input={input} "
+#                "--output={output.bam} "
+#		"--metrics={output.metrics} "
+#                "--rejects={output.rejects} "
+#                "--max-mismatches=3 "
+#		"--min-distance=2 "
+#		"--umi-tag=RX "
+#		"--umi-files={params.umis_list} "
+#
+#rule get_fixedUMIs:
+#	input:expand(BAM_DIR + "/{sample}_fixedUMIs.bam",sample = SAMPLES)
+#
+#----------------------------------------------------------------------
+# C/D.2 Group read families
+# -----------------------------------------------------------------
+rule bam_UMI_group_reads_by_UMI:
+        input: BAM_DIR_INPUT + "/{sample}_mapped.bam"
+        output: BAM_DIR + "/{sample}_groupedUMI.bam"
+        params:
+                java = config["software"]["java"],
+                fgbio_jar = config["software"]["fgbio_jar"],
+		histo = "histograms/{sample}_histogram_family_size.tsv"
+        log: "logs/bam_UMI.group_reads_by_UMI/{sample}.log"
+        shell:
+                "{params.java} -Xmx16G -jar {params.fgbio_jar} GroupReadsByUmi "
+                "--input={input} "
+                "--output={output} "
+                "--strategy=paired --min-map-q=20 --edits=1 --family-size-histogram={params.histo}"
+
+rule get_groupedUMI_bam:
+        input: expand(BAM_DIR + "/{sample}_groupedUMI.bam", sample = SAMPLES)
+
+#----------------------------------------------------------------------
+# C. Error correction by collapsing single read families
+#----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
+# C.3. Collapse single read families
+# by combining each set of reads using CallMolecularConsensusReads (fgbio)
+## This step generates collapsed single read families as an unmaped BAM from the output of GroupReadsByUMI
+#Updated to use paired info and group reads by Duplex consensus rather than SSCS
+#Commented out old rule from Gerben
+#----------------------------------------------------------------------
+rule bam_SS_UMI_generate_consensus_reads:
+        input: BAM_DIR + "/{sample}_groupedUMI.bam"
+        output:
+                output=BAM_DIR + "/{sample}_ss_consensus.unmapped.bam",
+                rejects=BAM_DIR + "/{sample}_ss_consensus.rejects.bam"
+        params:
+                java = config["software"]["java"],
+                fgbio_jar = config["software"]["fgbio_jar"],
+                id = "{sample}"
+        log: "logs/bwa_SS_UMI.generate_consensus_reads/{sample}.log"
+        shell:
+                "{params.java} -Xmx16G -jar {params.fgbio_jar} CallMolecularConsensusReads "
+                "--input={input} "
+                "--output={output.output} "
+                "--rejects={output.rejects} "
+                "--min-input-base-quality=20 --min-reads=1 "
+                "--read-group-id={params.id}"
+
+#Not enough coverage to use the duplex consensus read calling
+#"{params.java} -Xmx16G -jar {params.fgbio_jar} CallDuplexConsensusReads "
+
+#rule bam_SS_UMI_generate_consensus_reads:
+#        input: BAM_DIR + "/{sample}_groupedUMI.bam"
+#        output:
+#                output=BAM_DIR + "/{sample}_ss_consensus.unmapped.bam",
+#                rejects=BAM_DIR + "/{sample}_ss_consensus.rejects.bam"
+#        params:
+#                java = config["software"]["java"],
+#                fgbio_jar = config["software"]["fgbio_jar"],
+#                id = "{sample}"
+#        log: "logs/bwa_SS_UMI.generate_consensus_reads/{sample}.log"
+#        shell:
+#                "{params.java} -Xmx16G -jar {params.fgbio_jar} CallMolecularConsensusReads "
+#                "--input={input} "
+#                "--output={output.output} "
+#                "--rejects={output.rejects} "
+#                "--error-rate-pre-umi=45 --error-rate-post-umi=30 --min-input-base-quality=30 --min-#reads=1 "
+#                "--read-group-id={params.id}"
+
+rule get_consensus_unmapped_bam:
+        input: expand(BAM_DIR + "/{sample}_ss_consensus.unmapped.bam", sample = SAMPLES)
+
+#----------------------------------------------------------------------
+# C.4 Align collapsed families
+# After you have generated collapsed single read families, you must remap the reads and merge mapped/unmapped BAMs to retain the appropriate metadata in the mapped file.
+# The mapping procedure is the same for raw reads described previously
+#----------------------------------------------------------------------
+rule order_sort_bam:
+        input: BAM_DIR + "/{sample}_ss_consensus.unmapped.bam"
+        output: BAM_DIR+ "/{sample}_ss_consensus.tmp.unmapped.bam"
+        resources:
+                mem_mb=30000
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"]
+        log: "logs/bwa_SS_UMI.sort_bam/{sample}.log"
+        shell:
+                "{params.java} -Xmx32G -jar {params.picard_jar} SortSam I={input} O={output} SORT_ORDER=queryname"
+
+rule bam_SS_UMI_remap_consensus_reads:
+        input: BAM_DIR + "/{sample}_ss_consensus.tmp.unmapped.bam"
+        output: BAM_DIR + "/{sample}_ss_consensus.mapped.bam"
+        resources:
+                mem_mb=30000
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                bwa = config["software"]["bwa"],
+                ref = config["reference"]["hg19"]["ref_fa"]
+        log: "logs/bwa_SS_UMI.remap_consensus_reads/{sample}.log"
+        shell:
+                "{params.java} -Xmx32G -jar {params.picard_jar} SamToFastq "
+                "I={input} F=/dev/stdout INTERLEAVE=true "
+                "| {params.bwa} mem -p -t 8 {params.ref} /dev/stdin "
+                "| {params.java} -Xmx32G -jar {params.picard_jar} SortSam I=/dev/stdin O=/dev/stdout SORT_ORDER=queryname"
+                "| {params.java} -Xmx32G -jar {params.picard_jar} MergeBamAlignment "
+                "UNMAPPED={input} ALIGNED=/dev/stdin "
+                "O={output} R={params.ref} "
+                "SO=coordinate ALIGNER_PROPER_PAIR_FLAGS=true MAX_GAPS=-1 "
+                "ORIENTATIONS=FR VALIDATION_STRINGENCY=SILENT CREATE_INDEX=true"
+
+rule get_consensus_mapped_bam:
+        input: expand(BAM_DIR + "/{sample}_ss_consensus.mapped.bam", sample = SAMPLES)
+
+#----------------------------------------------------------------------
+# C.5. Filter collapsed families
+#----------------------------------------------------------------------
+rule bam_SS_UMI_filter_consensus_reads:
+        input: BAM_DIR + "/{sample}_ss_consensus.mapped.bam"
+        output: BAM_DIR + "/{sample}_ss_consensus.mapped.umi_filtered.bam"
+        params:
+                fgbio_jar = config["software"]["fgbio_jar"],
+                java = config["software"]["java"],
+                ref = config["reference"]["hg19"]["ref_fa"],
+                samtools = config["software"]["samtools"]
+        log: "logs/bwa_SS_UMI.filter_consensus_reads/{sample}.log"
+        shell:
+                "{params.samtools} sort -n -u {input} | "
+                "{params.java} -Xmx16G -jar {params.fgbio_jar} FilterConsensusReads "
+                "--input=/dev/stdin "
+                "--output={output} "
+                "--ref={params.ref} "
+                "--min-reads=1 --max-read-error-rate=0.05 --max-base-error-rate=0.1 --min-base-quality=40 --max-no-calls=0.1"
+
+rule get_consensus_mapped_filtered_bam:
+        input: expand(BAM_DIR + "/{sample}_ss_consensus.mapped.umi_filtered.bam", sample = SAMPLES)
+#----------------------------------------------------------------------
+# D. Error correction by collapsing combined read families
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+# D.3 Collapse combined read families
+#----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
+# D.4 Align collapsed combined families
+#----------------------------------------------------------------------
+
+#----------------------------------------------------------------------
+# D.5 Filter collapsed combined famlies
+#----------------------------------------------------------------------
+#
+
+#----------------------------------------------------------------------
+# **VARIANT CALLING**  
+#----------------------------------------------------------------------
+#----------------------------------------------------------------------
+# Clip overlap between read pairs
+#----------------------------------------------------------------------
+# Updated filename to output {}.unsorted.bam since this file is not order sorted
+# Added in a new rule "sort_clipped_bam" to sort the resultant file
+rule bam_SS_UMI_clip_bam:
+        input: BAM_DIR + "/{sample}_ss_consensus.mapped.umi_filtered.bam"
+        output: BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.unsorted.bam"
+        params:
+                fgbio_jar = config["software"]["fgbio_jar"],
+                java = config["software"]["java"],
+                ref = config["reference"]["hg19"]["ref_fa"]
+        log: "logs/bwa_SS_UMI.clip_bam/{sample}.log"
+        shell:
+                "{params.java} -Xmx16G -jar {params.fgbio_jar} ClipBam "
+                "--input={input} "
+                "--output={output} "
+                "--ref={params.ref} "
+                "--upgrade-clipping=false --clip-overlapping-reads=true"
+
+rule sort_clipped_bam:
+        input: BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.unsorted.bam"
+        output: BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.bam"
+        params:
+                samtools = config["software"]["samtools"]
+        log: "logs/sort_bam/{sample}.log"
+        shell:
+                "{params.samtools} sort -o {output} {input} &> {log}"
+
+
+rule get_clipped_bam_SS_UMI:
+        input: expand(BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.bam.bai", sample = SAMPLES)
+
+#--------------------
+# ---------------------------------------------------------------
+# QC 
+# --------------------------------------------------------------
+rule picard_QC_UMI_start_stop:
+        input:
+                "metrics/all.alignment_summary_metrics.pair.txt",
+                "metrics/all.insert_size_metrics.txt",
+                "metrics/all.hs_metrics_UMI_markdup.txt",
+                expand("metrics/{sample}_UMI_markdup.flagstats", sample = SAMPLES)
+# --------------------------------------------------------------
+
+rule merge_alignment_summary_UMI_start_stop:
+        input: expand("metrics/{sample}.alignment_summary_metrics", sample = SAMPLES)
+        output: "metrics/all.alignment_summary_metrics.pair.txt"
+        shell:
+                """
+                grep -v '#' {input[0]} | sed '/^$/d' | head -n 1 | cut -f 2- > {output}.header &&
+                for file in {input}; do
+                        grep -v '#' ${{file}} | sed '/^$/d' | tail -n 1 | cut -f 2- >> {output}.tmp;
+                done
+                echo {SAMPLES} | sed 's/ /\\n/g' | paste - {output}.tmp > {output} &&
+                echo -e 'sampleID' | paste - {output}.header | cat - {output} > {output}.tmp &&
+                mv {output}.tmp {output} && rm {output}.header
+                """
+
+rule merge_insert_metrics_UMI_start_stop:
+        input: expand("metrics/{sample}.insert_size_metrics", sample = SAMPLES)
+        output: "metrics/all.insert_size_metrics.txt"
+        shell:
+                """
+                awk 'NR == 7' {input[0]} > {output}.header;
+                for file in {input}; do
+                        awk 'NR == 8' ${{file}} >> {output}.tmp;
+                done
+                echo {SAMPLES} | sed 's/ /\\n/g' | paste - {output}.tmp > {output} &&
+                echo -e 'sampleID' | paste - {output}.header | cat - {output} > {output}.tmp &&
+                mv {output}.tmp {output} && rm {output}.header
+                """
+# --------------------------------------------------------------
+rule run_alignment_summary_UMI_start_stop:
+        input: BAM_DIR + "/{sample}_mapped.markdup_UMI.bam"
+        output:
+                "metrics/{sample}.alignment_summary_metrics",
+                "metrics/{sample}.insert_size_metrics"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                ref = config["reference"]["hg19"]["ref_fa"]
+        log: "logs/collect_multiple_metrics/{sample}.log"
+        shell:
+                "{params.java} -Xmx12g -jar {params.picard_jar} CollectMultipleMetrics VALIDATION_STRINGENCY=LENIENT I={input} O=metrics/{wildcards.sample} REFERENCE_SEQUENCE={params.ref} &> {log}"
+
+# --------------------------------------------------------------
+rule merge_hs_metrics_UMI_start_stop:
+        input: expand("metrics/{sample}.markdup_UMI.hs_metrics.txt", sample = SAMPLES)
+        output: "metrics/all.hs_metrics_UMI_markdup.txt"
+        shell:
+                """
+                grep -v '#' {input[0]} | sed '/^$/d' | head -n 1 | cut -f 2- > {output}.header &&
+                for file in {input}; do
+                        echo 'Processing file:' ${{file}};
+                        grep -v '#' ${{file}} | sed '/^$/d' | sed -n 2p | cut -f 2- >> {output}.tmp;
+                done &&
+                echo {SAMPLES} | sed 's/ /\\n/g' | paste - {output}.tmp > {output} &&
+                echo -e 'sampleID' | paste - {output}.header | cat - {output} > {output}.tmp &&
+                mv {output}.tmp {output} && rm {output}.header
+                """
+
+rule run_hs_metrics_UMI_start_stop:
+        input: BAM_DIR + "/{sample}_mapped.markdup_UMI.bam"
+        output:
+                hs = "metrics/{sample}.markdup_UMI.hs_metrics.txt",
+                int = "metrics/{sample}.markdup_UMI.interval_hs_metrics.txt"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                ref = config["reference"]["hg19"]["ref_fa"],
+                intervals = "data/interval_list.txt"
+        log: "logs/hs_metrics/{sample}_markdup_UMI.log"
+        shell:
+                "{params.java} -Xmx4g -jar {params.picard_jar} CalculateHsMetrics BAIT_INTERVALS={params.intervals} TARGET_INTERVALS={params.intervals} I={input} O={output.hs} PER_TARGET_COVERAGE={output.int} REFERENCE_SEQUENCE={params.ref} &> {log}"
+#--------------------------------------------------------
+rule run_flagstats:
+        input: BAM_DIR + "/{sample}_mapped.markdup_UMI.bam"
+        output: "metrics/{sample}_UMI_markdup.flagstats"
+        params:
+                samtools = config["software"]["samtools"]
+        log: "logs/flagstats/{sample}.log"
+        shell:
+                "{params.samtools} flagstat {input} > {output} 2> {log}"
+
+#--------------------------------------------------------
+ 
+rule merge_hs_metrics_UMI_error_single:
+        input: expand("metrics/{sample}.UMI_error_single.hs_metrics.txt", sample = SAMPLES)
+        output: "metrics/all_UMI_error_single.hs_metrics.txt"
+        shell:
+                """
+                grep -v '#' {input[0]} | sed '/^$/d' | head -n 1 | cut -f 2- > {output}.header &&
+                for file in {input}; do
+                        echo 'Processing file:' ${{file}};
+                        grep -v '#' ${{file}} | sed '/^$/d' | sed -n 2p | cut -f 2- >> {output}.tmp;
+                done &&
+                echo {SAMPLES} | sed 's/ /\\n/g' | paste - {output}.tmp > {output} &&
+                echo -e 'sampleID' | paste - {output}.header | cat - {output} > {output}.tmp &&
+                mv {output}.tmp {output} && rm {output}.header
+                """
+
+rule run_hs_metrics_UMI_error_single:
+	input: BAM_DIR + "/{sample}_ss_consensus.mapped.umi_filtered.bam"
+        output:
+                hs = "metrics/{sample}.UMI_error_single.hs_metrics.txt",
+                int = "metrics/{sample}.UMI_error_single.interval_hs_metrics.txt"
+	params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                ref = config["reference"]["hg19"]["ref_fa"],
+                intervals = "data/interval_list.txt"
+	log: "logs/hs_metrics/UMI_error_single/{sample}.log"
+        shell:
+               "{params.java} -Xmx4g -jar {params.picard_jar} CalculateHsMetrics BAIT_INTERVALS={params.intervals} TARGET_INTERVALS={params.intervals} I={input} O={output.hs} PER_TARGET_COVERAGE={output.int} REFERENCE_SEQUENCE={params.ref} &> {log}"
+
+#--------------------------------------------------
+#Utility functions to process BAM files
+#---------------------------------------------------
+
+# Merge and combine read groups:
+rule merge_normal_bams:
+	input:
+                sample1 = BAM_DIR + "/BM10-5072_ss_consensus.mapped.filtered.clipped.bam",
+                sample2 = BAM_DIR + "/BM18-00056_ss_consensus.mapped.filtered.clipped.bam",
+                sample3 = BAM_DIR + "/BM18-01821_ss_consensus.mapped.filtered.clipped.bam",
+                sample4 = BAM_DIR + "/BM14-6403_ss_consensus.mapped.filtered.clipped.bam",
+                sample5 = BAM_DIR + "/BM14-2038_ss_consensus.mapped.filtered.clipped.bam",
+                sample6 = BAM_DIR + "/BM15-2304_ss_consensus.mapped.filtered.clipped.bam",
+                sample7 = BAM_DIR + "/BM18-00172_ss_consensus.mapped.filtered.clipped.bam",
+                sample8 = BAM_DIR + "/BM13-7593_ss_consensus.mapped.filtered.clipped.bam",
+                sample9 = BAM_DIR + "/BM14-3340_ss_consensus.mapped.filtered.clipped.bam",
+                sample10 = BAM_DIR + "/BM14-3386_ss_consensus.mapped.filtered.clipped.bam",
+                sample11 = BAM_DIR + "/BM14-8977_ss_consensus.mapped.filtered.clipped.bam",
+                sample12 = BAM_DIR + "/BM14-3177_ss_consensus.mapped.filtered.clipped.bam",
+                sample13 = BAM_DIR + "/BM14-5462_ss_consensus.mapped.filtered.clipped.bam",
+                sample14 = BAM_DIR + "/BM15-3762_ss_consensus.mapped.filtered.clipped.bam",
+                sample15 = BAM_DIR + "/BM15-1358_ss_consensus.mapped.filtered.clipped.bam"
+
+	output:BAM_DIR + "/merged_constitutional_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+	params:
+		java = config["software"]["java"],
+		picard_jar = config["software"]["picard_jar"]
+	shell: 
+		"{params.java} -Xmx4g -jar {params.picard_jar} MergeSamFiles I={input.sample1} I={input.sample2} I={input.sample3} I={input.sample4} I={input.sample5} I={input.sample6} I={input.sample7} I={input.sample8} I={input.sample9} I={input.sample10} I={input.sample11} I={input.sample12} I={input.sample13} I={input.sample14} I={input.sample15} O={output} MERGE_SEQUENCE_DICTIONARIES=true  CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT"
+
+rule combine_normal_read_groups:
+        input:  BAM_DIR + "/merged-constitutional_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+        output: BAM_DIR + "/merged-constitutional_ss_consensus.mapped.filtered.clipped.bam"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                rgid = "merged_constitutional"
+        shell:
+                "{params.java} -jar {params.picard_jar} AddOrReplaceReadGroups "
+                "I={input} "
+                "O={output} "
+                "RGID={params.rgid} "
+                "RGLB={params.rgid} "
+                "RGPL=ILLUMINA "
+                "RGPU=unit1 "
+                "RGSM={params.rgid} "
+                "CREATE_INDEX=true"
+
+
+# Merge and combine read groups (set2):
+rule merge_normal_bams_2:
+	input:
+                sample1 = BAM_DIR + "/BM15-1510_ss_consensus.mapped.filtered.clipped.bam",
+                sample2 = BAM_DIR + "/BM15-2360_ss_consensus.mapped.filtered.clipped.bam",
+                sample3 = BAM_DIR + "/BM15-2672_ss_consensus.mapped.filtered.clipped.bam",
+                sample4 = BAM_DIR + "/BM15-6921_ss_consensus.mapped.filtered.clipped.bam",
+                sample5 = BAM_DIR + "/BM15-8031_ss_consensus.mapped.filtered.clipped.bam",
+                sample6 = BAM_DIR + "/BM15-9712_ss_consensus.mapped.filtered.clipped.bam",
+                sample7 = BAM_DIR + "/BM16-04422_ss_consensus.mapped.filtered.clipped.bam",
+                sample8 = BAM_DIR + "/BM16-09703_ss_consensus.mapped.filtered.clipped.bam",
+                sample9 = BAM_DIR + "/BM17-03905_ss_consensus.mapped.filtered.clipped.bam",
+                sample10 = BAM_DIR + "/BM17-07493_ss_consensus.mapped.filtered.clipped.bam",
+                sample11 = BAM_DIR + "/BM17-08676_ss_consensus.mapped.filtered.clipped.bam",
+                sample12 = BAM_DIR + "/BM18-00840_ss_consensus.mapped.filtered.clipped.bam",
+                sample13 = BAM_DIR + "/BM18-05320_ss_consensus.mapped.filtered.clipped.bam",
+                sample14 = BAM_DIR + "/BM18-06993_ss_consensus.mapped.filtered.clipped.bam",
+                sample15 = BAM_DIR + "/BM18-08051_ss_consensus.mapped.filtered.clipped.bam",
+		sample16 = BAM_DIR + "/BM18-08833_ss_consensus.mapped.filtered.clipped.bam"
+
+	output:BAM_DIR + "/merged_constitutional_2_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+	params:
+		java = config["software"]["java"],
+		picard_jar = config["software"]["picard_jar"]
+	shell: 
+		"{params.java} -Xmx4g -jar {params.picard_jar} MergeSamFiles I={input.sample1} I={input.sample2} I={input.sample3} I={input.sample4} I={input.sample5} I={input.sample6} I={input.sample7} I={input.sample8} I={input.sample9} I={input.sample10} I={input.sample11} I={input.sample12} I={input.sample13} I={input.sample14} I={input.sample15} I={input.sample16} O={output} MERGE_SEQUENCE_DICTIONARIES=true  CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT"
+
+rule combine_normal_read_groups_2:
+        input:  BAM_DIR + "/merged-constitutional-2_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+        output: BAM_DIR + "/merged-constitutional-2_ss_consensus.mapped.filtered.clipped.bam"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                rgid = "merged_constitutional"
+        shell:
+                "{params.java} -jar {params.picard_jar} AddOrReplaceReadGroups "
+                "I={input} "
+                "O={output} "
+                "RGID={params.rgid} "
+                "RGLB={params.rgid} "
+                "RGPL=ILLUMINA "
+                "RGPU=unit1 "
+                "RGSM={params.rgid} "
+                "CREATE_INDEX=true"
+
+
+# Merge normal_bams_QC_filtered (2021SEP20GD)
+
+rule merge_normal_bams_QC_filtered_1:
+	input:
+                sample1 = BAM_DIR + "/BM10-5072_ss_consensus.mapped.filtered.clipped.bam",
+                sample2 = BAM_DIR + "/BM18-00056_ss_consensus.mapped.filtered.clipped.bam",
+                sample3 = BAM_DIR + "/BM18-01821_ss_consensus.mapped.filtered.clipped.bam",
+                sample4 = BAM_DIR + "/BM14-6403_ss_consensus.mapped.filtered.clipped.bam",
+                sample5 = BAM_DIR + "/BM14-2038_ss_consensus.mapped.filtered.clipped.bam",
+                sample6 = BAM_DIR + "/BM15-2304_ss_consensus.mapped.filtered.clipped.bam",
+                sample7 = BAM_DIR + "/BM14-3340_ss_consensus.mapped.filtered.clipped.bam",
+                sample8 = BAM_DIR + "/BM14-3386_ss_consensus.mapped.filtered.clipped.bam",
+                sample9 = BAM_DIR + "/BM14-8977_ss_consensus.mapped.filtered.clipped.bam",
+                sample10 = BAM_DIR + "/BM14-5462_ss_consensus.mapped.filtered.clipped.bam",
+                sample11 = BAM_DIR + "/BM15-3762_ss_consensus.mapped.filtered.clipped.bam",
+                sample12 = BAM_DIR + "/BM15-1358_ss_consensus.mapped.filtered.clipped.bam",
+		sample13 = BAM_DIR + "/BM18-08833_ss_consensus.mapped.filtered.clipped.bam"
+
+	output:BAM_DIR + "/merged_constitutional_1_QCfiltered_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+	params:
+		java = config["software"]["java"],
+		picard_jar = config["software"]["picard_jar"]
+	shell: 
+		"{params.java} -Xmx4g -jar {params.picard_jar} MergeSamFiles I={input.sample1} I={input.sample2} I={input.sample3} I={input.sample4} I={input.sample5} I={input.sample6} I={input.sample7} I={input.sample8} I={input.sample9} I={input.sample10} I={input.sample11} I={input.sample12} I={input.sample13} O={output} MERGE_SEQUENCE_DICTIONARIES=true  CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT"
+
+
+rule combine_normal_read_groups_1_QC:
+        input:  BAM_DIR + "/merged_constitutional_1_QCfiltered_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+        output: BAM_DIR + "/merged-constitutional-1-QCfiltered_ss_consensus.mapped.filtered.clipped.bam"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                rgid = "merged_constitutional"
+        shell:
+                "{params.java} -jar {params.picard_jar} AddOrReplaceReadGroups "
+                "I={input} "
+                "O={output} "
+                "RGID={params.rgid} "
+                "RGLB={params.rgid} "
+                "RGPL=ILLUMINA "
+                "RGPU=unit1 "
+                "RGSM={params.rgid} "
+
+rule merge_normal_bams_QC_filtered_2:
+	input:
+                sample1 = BAM_DIR + "/BM15-1510_ss_consensus.mapped.filtered.clipped.bam",
+                sample2 = BAM_DIR + "/BM15-2360_ss_consensus.mapped.filtered.clipped.bam",
+                sample3 = BAM_DIR + "/BM15-2672_ss_consensus.mapped.filtered.clipped.bam",
+                sample4 = BAM_DIR + "/BM15-6921_ss_consensus.mapped.filtered.clipped.bam",
+                sample5 = BAM_DIR + "/BM15-8031_ss_consensus.mapped.filtered.clipped.bam",
+                sample6 = BAM_DIR + "/BM15-9712_ss_consensus.mapped.filtered.clipped.bam",
+                sample7 = BAM_DIR + "/BM16-04422_ss_consensus.mapped.filtered.clipped.bam",
+                sample8 = BAM_DIR + "/BM16-09703_ss_consensus.mapped.filtered.clipped.bam",
+                sample9 = BAM_DIR + "/BM17-03905_ss_consensus.mapped.filtered.clipped.bam",
+                sample10 = BAM_DIR + "/BM17-07493_ss_consensus.mapped.filtered.clipped.bam",
+                sample11 = BAM_DIR + "/BM18-00840_ss_consensus.mapped.filtered.clipped.bam",
+                sample12 = BAM_DIR + "/BM18-05320_ss_consensus.mapped.filtered.clipped.bam",
+                sample13 = BAM_DIR + "/BM18-06993_ss_consensus.mapped.filtered.clipped.bam",
+                sample14 = BAM_DIR + "/BM18-08051_ss_consensus.mapped.filtered.clipped.bam"
+
+	output:BAM_DIR + "/merged_constitutional_2_QCfiltered_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+	params:
+		java = config["software"]["java"],
+		picard_jar = config["software"]["picard_jar"]
+	shell: 
+		"{params.java} -Xmx4g -jar {params.picard_jar} MergeSamFiles I={input.sample1} I={input.sample2} I={input.sample3} I={input.sample4} I={input.sample5} I={input.sample6} I={input.sample7} I={input.sample8} I={input.sample9} I={input.sample10} I={input.sample11} I={input.sample12} I={input.sample13} I={input.sample14} O={output} MERGE_SEQUENCE_DICTIONARIES=true  CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT"
+
+
+rule combine_normal_read_groups_2_QC:
+        input:  BAM_DIR + "/merged_constitutional_2_QCfiltered_unique_RGS_ss_consensus.mapped.filtered.clipped.bam"
+        output: BAM_DIR + "/merged-constitutional-2-QCfiltered_ss_consensus.mapped.filtered.clipped.bam"
+        params:
+                java = config["software"]["java"],
+                picard_jar = config["software"]["picard_jar"],
+                rgid = "merged_constitutional"
+        shell:
+                "{params.java} -jar {params.picard_jar} AddOrReplaceReadGroups "
+                "I={input} "
+                "O={output} "
+                "RGID={params.rgid} "
+                "RGLB={params.rgid} "
+                "RGPL=ILLUMINA "
+                "RGPU=unit1 "
+                "RGSM={params.rgid} "
+
+
+
+#rule sort_bam:
+#        input: "{sample}.bam"
+#        output: "{sample}.sorted.bam"
+#        params:
+#                samtools = config["software"]["samtools"]
+#        log: "logs/sort_bam/{sample}.log"
+#        shell:
+#                "{params.samtools} sort -o {output} {input} &> {log} && rm {input}"
+#
+rule get_indexed_bam:
+       input: expand(BAM_DIR + "/{sample}.bam.bai", sample = SAMPLES)	
+
+rule index_bam:
+        input: "{sample}.bam"
+        output: "{sample}.bam.bai"
+        params:
+                samtools = config["software"]["samtools"],
+                log = lambda wildcards: "logs/index_bam/" + os.path.basename(wildcards.sample) + ".log"
+        shell:
+                "mkdir -p logs/index_bam && {params.samtools} index {input} &> {params.log}"
+
+#------------------------------------------
+# CNVKIT
+#-----------------------------------------
+
+rule cnvkit:
+	input:
+		"cnvkit/merged/merged_heatmap.pdf",
+		"cnvkit/merged/segmentation_files.seg",
+		expand("cnvkit/genemetrics/segment/{tumor_sample}_mapped.markdup_UMI.txt",tumor_sample = TUMOR_SAMPLES),
+		expand("cnvkit/genemetrics/gene/{tumor_sample}_mapped.markdup_UMI.txt",tumor_sample = TUMOR_SAMPLES),
+		expand("cnvkit/scatter/{tumor_sample}_scatter_mapped.markdup_UMI.pdf",tumor_sample = TUMOR_SAMPLES),
+        	expand("cnvkit/scatter_chr17/{tumor_sample}_scatter_chr17_mapped.markdup_UMI.pdf",tumor_sample = TUMOR_SAMPLES)
+			
+
+rule run_cnvkit_batch:
+        input:
+                tumor_bams = expand(BAM_DIR + "/{sample}_mapped.markdup_UMI.bam", sample = TUMOR_SAMPLES),
+                normal_bams = expand(BAM_DIR + "/{normal_sample}_mapped.markdup_UMI.bam", normal_sample = SAMPLE_PAIRS.values())
+        output: expand("cnvkit/{sample}_mapped.markdup_UMI.{filetype}",sample = TUMOR_SAMPLES,filetype = ["cns","cnr"])
+        params:
+                cnvkit = config["software"]["cnvkit"],
+                access = config["reference"]["hg19"]["cnvkit_access"],
+                targets = config["targets_file"],
+                fasta = config["reference"]["hg19"]["ref_fa"],
+                refFlat = config["reference"]["hg19"]["refFlat"]
+	log: "logs/cnvkit/all_run_cnvkit.log"
+        threads: 8
+        shell:
+                "{params.cnvkit} batch {input.tumor_bams} --normal {input.normal_bams} --targets {params.targets} --fasta {params.fasta} --access {params.access} --annotate {params.refFlat} --processes {threads} --output-reference cnvkit/normal_reference.cnn --scatter --diagram  --output-dir cnvkit/ &> {log}"
+
+rule run_cnvkit_call:
+        input: "cnvkit/{sample}_mapped.markdup_UMI.cns"
+        output: "cnvkit/{sample}_mapped.markdup_UMI.call.cns"
+        params:
+                cnvkit = config["software"]["cnvkit"]
+        log: "logs/cnvkit/call/{sample}.log"
+        shell:
+                "{params.cnvkit} call {input} -o {output} &> {log}"
+
+rule get_CNVs:
+        input: expand("cnvkit/{sample}_mapped.markdup_UMI.{filetype}", sample = TUMOR_SAMPLES, filetype = ["cns","call.cns"])
+
+rule run_cnvkit_scatter:
+        input:
+                cnr = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cnr",
+                cns = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cns"
+        output: "cnvkit/scatter/{tumor_sample}_scatter_mapped.markdup_UMI.pdf"
+        params:
+                cnvkit = config["software"]["cnvkit"]
+        log: "logs/cnvkit/scatter/{tumor_sample}_scatter_mapped.markdup_UMI.log"
+        shell:
+                "{params.cnvkit} scatter {input.cnr} -s {input.cns} --output {output} &> {log}"
+
+rule run_cnvkit_scatter_chr17:
+        input:
+                cnr = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cnr",
+                cns = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cns"
+        output: "cnvkit/scatter_chr17/{tumor_sample}_scatter_chr17_mapped.markdup_UMI.pdf"
+        params:
+                cnvkit = config["software"]["cnvkit"]
+        log: "logs/cnvkit/scatter_chr17/{tumor_sample}_scatter_chr3_mapped.markdup_UMI.log"
+        shell:
+                "{params.cnvkit} scatter {input.cnr} -c chr17 -g VMP1 -s {input.cns} --output {output} &> {log}"
+
+
+rule cnvkit_heatmap:
+        input: expand("cnvkit/{tumor_sample}_mapped.markdup_UMI.cns",tumor_sample = TUMOR_SAMPLES)
+        output: "cnvkit/merged/merged_heatmap.pdf"
+        params:
+                cnvkit = config["software"]["cnvkit"]
+        log: "logs/cnvkit/merged/merged_heatmap.log"
+        shell:
+                "{params.cnvkit} heatmap --output {output} {input} &> {log}"
+
+rule  cnvkit_genemetrics:
+	input:
+                cnr = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cnr",
+                cns = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cns"
+	output:"cnvkit/genemetrics/segment/{tumor_sample}_mapped.markdup_UMI.txt"
+	params:
+                cnvkit = config["software"]["cnvkit"]
+	shell:
+		"{params.cnvkit} genemetrics {input.cnr} -s {input.cns} -t 0.00001 -m 1 --output {output}"
+	
+
+rule  cnvkit_genemetrics_gene:
+	input:
+                cnr = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cnr",
+                cns = "cnvkit/{tumor_sample}_mapped.markdup_UMI.cns"
+	output:"cnvkit/genemetrics/gene/{tumor_sample}_mapped.markdup_UMI.txt"
+	params:
+                cnvkit = config["software"]["cnvkit"]
+	shell:
+		"{params.cnvkit} genemetrics {input.cnr} -t 0.0001 --output {output}"
+
+rule cnvkit_seg:
+        input: expand("cnvkit/{tumor_sample}_mapped.markdup_UMI.cns",tumor_sample = TUMOR_SAMPLES)
+        output: "cnvkit/merged/segmentation_files.seg"
+        params:
+                cnvkit = config["software"]["cnvkit"]
+	log: "logs/cnvkit/merged_seg.log"
+        shell:
+                "{params.cnvkit} export seg {input} --output {output} &> {log}"
+		
+#----------------------------------------------------------------------
+# Tumour-only variant calling with Mutect2 (GATK)
+#----------------------------------------------------------------------
+rule run_Mutect2_tumourOnly:
+        input:
+                bam = BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.bam",
+                bai = BAM_DIR + "/{sample}_ss_consensus.mapped.filtered.clipped.bam.bai"
+        output:
+                vcf = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz",
+                stats = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz.stats"
+        params:
+                gatk = config["software"]["gatk"],
+                ref = config["reference"]["hg19"]["ref_fa"],
+                pon = config["reference"]["hg19"]["pon"],
+                intervals = config["mutect_intervals_file"]
+        log: "logs/mutect2/{sample}.tumourOnly.log"
+        shell:
+                "{params.gatk} Mutect2 "
+                "-R {params.ref} "
+                "-I {input.bam} "
+                "-L {params.intervals} "
+                "--interval-padding 100 "
+                "-O {output.vcf} "
+                "&> {log}"
+
+#"--panel-of-normals {params.pon} "
+
+rule get_Mutect2_tumourOnly:
+        input: expand("mutect2/{sample}/{sample}.tumourOnly.vcf.gz.stats", sample = SAMPLES)
+
+#----------------------------------------------------------------------
+# Mutect2 variant filtering (GATK)
+#----------------------------------------------------------------------
+rule run_Mutect2_filtering:
+        input:
+                vcf = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz"
+        output:
+                vcf_out = "mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz"
+        params:
+                gatk = config["software"]["gatk"],
+                ref = config["reference"]["hg19"]["ref_fa"]
+        log: "logs/mutect2filtering/{sample}.tumourOnly.log"
+        shell:
+                "{params.gatk} FilterMutectCalls "
+                "-R {params.ref} "
+                "-V {input.vcf} "
+                "-O {output.vcf_out} "
+                "&> {log}"
+
+
+rule get_Mutect2_filtered:
+        input: expand("mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz", sample = SAMPLES)
+
+#----------------------------------------------------------------------
+# Mutect2 annotation (funcotator)
+#----------------------------------------------------------------------
+rule run_funcotator:
+        input:
+                vcf = "mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz"
+        output:
+                vcf_out = "mutect2/{sample}/{sample}.tumourOnly.funcotated.vcf.gz"
+        params:
+                gatk = config["software"]["gatk"],
+                ref = config["reference"]["hg19"]["ref_fa"],
+                func_source = config["software"]["funcotator"]
+        log: "logs/funcotator/{sample}.tumourOnly.log"
+        shell:
+                "{params.gatk} Funcotator "
+                "-R {params.ref} "
+                "-V {input.vcf} "
+                "-O {output.vcf_out} "
+                "--output-file-format VCF "
+                "--data-sources-path {params.func_source} "
+                "--ref-version hg19 "
+                "&> {log}"
+
+
+rule get_Funcotator:
+        input: expand("mutect2/{sample}/{sample}.tumourOnly.funcotated.vcf.gz", sample = SAMPLES)
