@@ -5,5 +5,6 @@ Builds on previous work from Dr. Gerben Duns (BCCancer), using his Snakemake pip
 
 The SNV calling pipeline (part of the same Snakemake pipeline) has been updated to run in tumour-only mode for all samples (HRS, blood, TME). Performs Mutect2 varaint calling, variant filtering, and Funcotator annotation of variants.
 
-Additionally, added in a python script to parse the Funcotated vcfs to create .tsv files with all information required to identify CHIP drivers and shared mutations between HRS and germline samples.
+Additionally, added in a python script (parse_vcf_2.py) to parse the Funcotated vcfs to create .tsv files with all information required to identify CHIP drivers and shared mutations between HRS and germline samples.
 
+Finally, added in an R script (pairedSamples.R) to identify shared variants in HRS and germline sequencing runs with evidence of clonal expansion in the HRS sample based on VAF of the driver mutation.
