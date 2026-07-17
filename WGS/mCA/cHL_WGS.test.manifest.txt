@@ -1,0 +1,2 @@
+CHOA-07-T.recal.bam	/cluster/projects/vannergroup/Stueckmann/out/sequenceData/cHL_WGS/CHOA-07-T.recal.bam	/cluster/projects/vannergroup/Stueckmann/out/sequenceData/cHL_WGS/CHOA-07-T.recal.bai
+
