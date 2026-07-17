@@ -1,0 +1,210 @@
+configfile: "general.yaml"
+import os
+import glob
+
+# ------------------------------------------------
+# Directories
+# ------------------------------------------------
+BAM_DIR_INPUT = config["bam_dir_input"]   # read-only EGA download directory
+BAM_DIR       = config["bam_dir"]         # writeable output directory
+
+# ------------------------------------------------
+# Discover input BAMs from nested EGA directory structure:
+# BAM_DIR_INPUT/EGAD########/EGAF########/{sample}.aligned.bam
+# ------------------------------------------------
+bam_paths = glob.glob(os.path.join(BAM_DIR_INPUT, "EGAD*", "EGAF*", "*.aligned.bam"))
+
+SAMPLE_TO_BAM = {
+    os.path.basename(p).replace(".aligned.bam", ""): p
+    for p in bam_paths
+}
+
+SAMPLES = list(SAMPLE_TO_BAM.keys())
+
+# ------------------------------------------------
+# Symlink input BAMs into BAM_DIR, then index the symlink.
+# GATK looks for the .bai next to the BAM by hardcoded convention, regardless
+# of what Snakemake declares as an input — since BAM_DIR_INPUT is read-only,
+# the BAM itself must be (sym)linked into BAM_DIR so the index can sit beside it.
+# ------------------------------------------------
+rule get_indexed_bam:
+    input: expand(BAM_DIR + "/{sample}.aligned.bam.bai", sample=SAMPLES)
+
+#need to create symlinks for read-only bam files to appear in same folder as index files
+#add ancient call to input so that output appears newer and doesn't need to be re-run
+#similarly, make sure to touch output to update the timestamp on the symlink
+rule link_bam:
+    input:  ancient(lambda wildcards: SAMPLE_TO_BAM[wildcards.sample])
+    output: BAM_DIR + "/{sample}.aligned.bam"
+    shell:
+        "ln -s {input} {output} && touch -h {output}"
+
+rule index_bam:
+    input:  BAM_DIR + "/{sample}.aligned.bam"
+    output: BAM_DIR + "/{sample}.aligned.bam.bai"
+    params:
+        samtools = config["software"]["samtools"]
+    log: "logs/index_bam/{sample}.log"
+    shell:
+        "mkdir -p logs/index_bam && "
+        "{params.samtools} index -o {output} {input} &> {log}"
+
+
+#----------------------------------------------------------------------
+# Base Quality Score Recalibration (GATK BQSR)
+#----------------------------------------------------------------------
+rule run_base_recalibrator:
+    input:
+        bam = BAM_DIR + "/{sample}.aligned.bam",
+        bai = BAM_DIR + "/{sample}.aligned.bam.bai"
+    output:
+        recal_table = BAM_DIR + "/{sample}.recal.table"
+    params:
+        gatk         = config["software"]["gatk"],
+        samtools     = config["software"]["samtools"],
+        ref          = config["reference"]["hg19"]["ref_fa"],
+        dbsnp        = config["reference"]["hg19"]["dbSNP"],
+        mills_indels = config["reference"]["hg19"]["mills_indels"],
+        intervals    = config["chroms_file"]
+    log: "logs/bqsr/{sample}.baserecalibrator.log"
+    shell:
+        "mkdir -p logs/bqsr && "
+        "{params.samtools} view -h -b -F 0x100 {input.bam} | "
+        "{params.gatk} BaseRecalibrator "
+        "-R {params.ref} "
+        "-I /dev/stdin "
+        "-L {params.intervals} "
+        "--known-sites {params.dbsnp} "
+        "--known-sites {params.mills_indels} "
+        "-O {output.recal_table} "
+        "&> {log}"
+
+rule run_apply_bqsr:
+    input:
+        bam         = BAM_DIR + "/{sample}.aligned.bam",
+        bai         = BAM_DIR + "/{sample}.aligned.bam.bai",
+        recal_table = BAM_DIR + "/{sample}.recal.table"
+    output:
+        bam = BAM_DIR + "/{sample}.recal.bam",
+        bai = BAM_DIR + "/{sample}.recal.bai"
+    params:
+        gatk     = config["software"]["gatk"],
+        samtools = config["software"]["samtools"],
+        ref      = config["reference"]["hg19"]["ref_fa"]
+    log: "logs/bqsr/{sample}.applybqsr.log"
+    shell:
+        "{params.samtools} view -h -b -F 0x100 {input.bam} | "
+        "{params.gatk} ApplyBQSR "
+        "-R {params.ref} "
+        "-I /dev/stdin "
+        "--bqsr-recal-file {input.recal_table} "
+        "-O {output.bam} "
+        "&> {log}"
+
+rule get_bqsr:
+    input: expand(BAM_DIR + "/{sample}.recal.bai", sample=SAMPLES)
+
+#----------------------------------------------------------------------
+# Tumour-only variant calling with Mutect2 (GATK)
+#----------------------------------------------------------------------
+rule run_Mutect2_tumourOnly:
+    input:
+        bam = BAM_DIR + "/{sample}.recal.bam",
+        bai = BAM_DIR + "/{sample}.recal.bai"
+    output:
+        vcf   = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz",
+        tbi   = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz.tbi",
+        stats = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz.stats"
+    params:
+        gatk      = config["software"]["gatk"],
+        ref       = config["reference"]["hg19"]["ref_fa"],
+        gnomad    = config["reference"]["hg19"]["gnomad_af"],
+        intervals = config["chroms_file"]
+    log: "logs/mutect2/{sample}.tumourOnly.log"
+    shell:
+        "{params.gatk} Mutect2 "
+        "-R {params.ref} "
+        "-I {input.bam} "
+        "-L {params.intervals} "
+        "--germline-resource {params.gnomad} "
+        "--af-of-alleles-not-in-resource 0.0000025 "
+        "-O {output.vcf} "
+        "&> {log}"
+
+rule get_Mutect2_tumourOnly:
+    input: expand("mutect2/{sample}/{sample}.tumourOnly.vcf.gz.stats", sample=SAMPLES)
+
+#----------------------------------------------------------------------
+# Mutect2 variant filtering (GATK)
+#----------------------------------------------------------------------
+rule run_Mutect2_filtering:
+    input:
+        vcf = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz",
+        tbi = "mutect2/{sample}/{sample}.tumourOnly.vcf.gz.tbi"
+    output:
+        vcf_out = "mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz"
+    params:
+        gatk = config["software"]["gatk"],
+        ref  = config["reference"]["hg19"]["ref_fa"]
+    log: "logs/mutect2filtering/{sample}.tumourOnly.log"
+    shell:
+        "{params.gatk} FilterMutectCalls "
+        "-R {params.ref} "
+        "-V {input.vcf} "
+        "-O {output.vcf_out} "
+        "&> {log}"
+
+rule get_Mutect2_filtered:
+    input: expand("mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz", sample=SAMPLES)
+
+#----------------------------------------------------------------------
+# Drop contigs absent from the Funcotator reference (e.g. hs37d5 decoy,
+# NC_007605 EBV) that were present in whatever reference the BAMs/VCF
+# were originally called against.
+#----------------------------------------------------------------------
+rule remove_incompatible_contigs:
+    input:
+        vcf = "mutect2/{sample}/{sample}.tumourOnly.filtered.vcf.gz"
+    output:
+        vcf = "mutect2/{sample}/{sample}.tumourOnly.filtered.contigsFixed.vcf.gz"
+    params:
+        bcftools = config["software"]["bcftools"],
+        drop_contigs_csv = "NC_007605,hs37d5",
+        drop_contigs_re = "NC_007605|hs37d5"
+    log: "logs/funcotator/{sample}.remove_incompatible_contigs.log"
+    shell:
+        "("
+        "{params.bcftools} view -h {input.vcf} "
+        "| grep -Ev '^##contig=<ID=({params.drop_contigs_re})' "
+        "> {output.vcf}.header.tmp "
+        "&& {params.bcftools} view -t ^{params.drop_contigs_csv} -Oz -o {output.vcf}.body.tmp {input.vcf} "
+        "&& {params.bcftools} reheader -h {output.vcf}.header.tmp -o {output.vcf} {output.vcf}.body.tmp "
+        "&& {params.bcftools} index -t {output.vcf} "
+        "&& rm {output.vcf}.header.tmp {output.vcf}.body.tmp"
+        ") &> {log}"
+
+#----------------------------------------------------------------------
+# Mutect2 annotation (funcotator)
+#----------------------------------------------------------------------
+rule run_funcotator:
+    input:
+        vcf = "mutect2/{sample}/{sample}.tumourOnly.filtered.contigsFixed.vcf.gz"
+    output:
+        vcf_out = "mutect2/{sample}/{sample}.tumourOnly.funcotated.vcf.gz"
+    params:
+        gatk = config["software"]["gatk"],
+        ref = config["reference"]["hg19"]["ref_fa"],
+        func_source = config["reference"]["hg19"]["funcotator"]
+    log: "logs/funcotator/{sample}.tumourOnly.log"
+    shell:
+        "{params.gatk} Funcotator "
+        "-R {params.ref} "
+        "-V {input.vcf} "
+        "-O {output.vcf_out} "
+        "--output-file-format VCF "
+        "--data-sources-path {params.func_source} "
+        "--ref-version hg19 "
+        "&> {log}"
+
+rule get_Funcotator:
+    input: expand("mutect2/{sample}/{sample}.tumourOnly.funcotated.vcf.gz", sample=SAMPLES)
